@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
+from utils import reparameterize
 
 from models.decoder import Decoder
 from models.encoder import Encoder
@@ -12,7 +13,7 @@ from models.encoder import Encoder
 class VaDE(nn.Module):
     """VaDE clustering model."""
 
-    def __init__(self, args: dict):
+    def __init__(self, args: dict, encoder=None, decoder=None):
         """
         Parameters
         ----------
@@ -24,8 +25,14 @@ class VaDE(nn.Module):
         super().__init__()
 
         # initialiaze symmetric encoder-decoder
-        self.encoder = Encoder(args)
-        self.decoder = Decoder(args)
+        if not encoder:
+            self.encoder = Encoder(args)
+        else:
+            self.encoder = encoder
+        if not decoder:
+            self.decoder = Decoder(args)
+        else:
+            self.decoder = decoder
 
         # intialize clusters for GMM
         self.pi_prior = nn.Parameter(
@@ -60,7 +67,9 @@ class VaDE(nn.Module):
         """
 
         # encoder
-        latent, means, log_vars = self.encoder(data)
+        means, log_vars = self.encoder(data)
+
+        latent = reparameterize(means, log_vars)
 
         # decoder
         x_hat = self.decoder(latent)
@@ -95,14 +104,24 @@ class VaDE(nn.Module):
 
         # iterate over each cluster
         for (mean, log_var) in zip(mu_priors, log_var_priors):
-            log_prob = torch.pow(latent - mean, 2) / torch.exp(log_var)
+            # print(f"latent shape: {latent.shape}")  # [128, 10]
+            # print(f"mean shape: {mean.shape}")  # [10]
+            # print(f"log var shape: {log_var.shape}")  # [10]
+            log_prob = torch.pow(latent - mean, 2)
+            # print(log_prob.shape)
+            # [128, 10]
             log_prob += log_var
             log_prob += np.log(2 * np.pi)
+            log_prob /= torch.exp(log_var)
             log_prob = -0.5 * torch.sum(log_prob, dim=1)
+            # print(log_prob.shape)
+            # [128]
 
             log_probs.append(log_prob.view(-1, 1))
 
-        return torch.cat(log_probs, 1)
+        cat_shape = torch.cat(log_probs, 1)
+        # print(cat_shape.shape)  # [128, 10]
+        return cat_shape
 
     def elbo_loss(
         self,
@@ -147,20 +166,24 @@ class VaDE(nn.Module):
 
         recon_loss = torch.nn.BCELoss()
 
-        # reconstruction loss
         elbo = recon_loss(reconstructed, data) * data.size(1)
 
         # prob of z given c (p(z|c))
-        log_probs = self.cluster_probabilities(latent)
+        log_probs = self.cluster_probabilities(latent)  # [128, 10]
+
+        # print(pi_prior.unsqueeze(0).shape) [1, 10]
 
         # gamma numerator
         gamma = torch.exp(torch.log(pi_prior.unsqueeze(0)) + log_probs) + 1e-11
 
         # probability of c given x (q(c|x))
-        gamma = gamma / gamma.sum(dim=1).unsqueeze(1)
+        # val = gamma / gamma.sum(dim=1).unsqueeze(1)
+        gamma = gamma / gamma.sum(dim=1).unsqueeze(1)  # [128, 10]
+
+        # print((val.sum(dim=1).shape))
 
         # first component of KL-divergence
-        kld = 0.5 * torch.mean(
+        elbo += 0.5 * torch.mean(
             torch.sum(
                 gamma
                 * torch.sum(
@@ -176,12 +199,11 @@ class VaDE(nn.Module):
             ),
         )
 
-        # second and third components of KL-divergence
-        kld -= torch.mean(torch.sum(gamma * torch.log(pi_prior.unsqueeze(0) / gamma), dim=1))
-        kld -= 0.5 * torch.mean(torch.sum(1 + log_vars, dim=1))
+        # print(f"kld: {kld}")
 
-        # add KL to ELBO loss
-        elbo += kld
+        # second and third components of KL-divergence
+        elbo -= torch.mean(torch.sum(gamma * torch.log(pi_prior.unsqueeze(0) / gamma), dim=1))
+        elbo -= 0.5 * torch.mean(torch.sum(1 + log_vars, dim=1))
 
         return elbo
 

@@ -9,7 +9,7 @@ import torch
 from dotenv import load_dotenv
 from matplotlib.patches import Ellipse
 from scipy.io import loadmat
-from sklearn.utils.linear_assignment_ import linear_assignment
+from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
 load_dotenv()
@@ -35,7 +35,7 @@ def init_weights(layer):
     """Initialize layer weights in a neural network."""
 
     if isinstance(layer, nn.Linear):
-        nn.init.xavier_uniform(layer.weight)
+        nn.init.xavier_uniform_(layer.weight)
         layer.bias.data.fill_(0.01)
 
 
@@ -89,10 +89,10 @@ def model_params() -> dict:
         "--batch_size", type=int, default=512, help="batch size used in training (default: 256)"
     )
     parser.add_argument(
-        "--epochs", type=int, default=10, help="number of epochs for model training (default: 5)"
+        "--epochs", type=int, default=100, help="number of epochs for model training (default: 5)"
     )
     parser.add_argument(
-        "--pre_epochs", type=int, default=10, help="number of epochs to pretrain VAE (default: 2)"
+        "--pre_epochs", type=int, default=50, help="number of epochs to pretrain VAE (default: 2)"
     )
     parser.add_argument(
         "--n_clusters", type=int, default=10, help="number of clusters in GMM (default: 3)"
@@ -145,6 +145,35 @@ def cluster_acc(Y_pred, Y):
     for i in range(Y_pred.size):
         w[Y_pred[i], Y[i]] += 1
 
-    ind = linear_assignment(w.max() - w)
+    row, col = linear_sum_assignment(w.max() - w)
 
-    return sum([w[i, j] for i, j in ind]) * 1.0 / Y_pred.size
+    return sum([w[i, j] for i, j in zip(row, col)]) * 1.0 / Y_pred.size
+
+
+def reparameterize(means: Tensor, log_vars: Tensor):
+    """
+    Use the reparameterization trick to randomly sample from the latent
+    distributions while still allowing for backpropogation.
+
+    Parameters
+    ----------
+    means : Tensor
+        Data containing latent variable distribution means.
+    log_vars : Tensor
+        Vector containing latent variable distribution log variances.
+    ----------
+
+    Returns
+    ----------
+    Tensor
+        Data sampled from distributions defined by means and log_vars.
+    ----------
+
+    """
+    # converting from log variance to variance
+    sampled_vars = torch.exp(0.5 * log_vars)
+
+    # reparameterization trick
+    eps = torch.randn_like(log_vars)
+
+    return means + (sampled_vars * eps)

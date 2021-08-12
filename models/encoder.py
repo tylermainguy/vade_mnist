@@ -56,34 +56,4 @@ class Encoder(nn.Module):
         means = self.means(data)
         log_vars = self.log_vars(data)
 
-        latent = self.reparameterize(means, log_vars)
-
-        return latent, means, log_vars
-
-    def reparameterize(self, means: Tensor, log_vars: Tensor):
-        """
-        Use the reparameterization trick to randomly sample from the latent
-        distributions while still allowing for backpropogation.
-
-        Parameters
-        ----------
-        means : Tensor
-            Data containing latent variable distribution means.
-        log_vars : Tensor
-            Vector containing latent variable distribution log variances.
-        ----------
-
-        Returns
-        ----------
-        Tensor
-            Data sampled from distributions defined by means and log_vars.
-        ----------
-
-        """
-        # converting from log variance to variance
-        sampled_vars = torch.exp(0.5 * log_vars)
-
-        # reparameterization trick
-        eps = torch.randn_like(log_vars)
-
-        return means + sampled_vars * eps
+        return means, log_vars

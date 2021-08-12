@@ -1,8 +1,10 @@
 """Pretraing VAE using reconstruction loss."""
 
 import gc
+import itertools
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -12,8 +14,10 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.vade import VaDE
-from utils import AverageMeter, cluster_acc, init_weights
+from utils import AverageMeter, DataParallelWrapper, cluster_acc, init_weights
 
 load_dotenv()
 
@@ -36,12 +40,18 @@ class Pretrain:
         self.device = args.device
         self.dataloader = dataloader
 
-        self.model = VaDE(args)
-        self.model.apply(init_weights)
-        self.model = self.model.to(self.device)
+        # self.model = VaDE(args)
+        self.encoder = Encoder(args)
+        self.decoder = Decoder(args)
+        # self.encoder.apply(init_weights)
+        # self.decoder.apply(init_weights)
+        self.decoder = self.decoder.to(self.device)
+        self.encoder = self.encoder.to(self.device)
 
         # adam optimizer
-        self.optimizer = Adam(self.model.parameters(), lr=args.pre_lr)
+        self.optimizer = Adam(
+            itertools.chain(self.encoder.parameters(), self.decoder.parameters()), lr=args.pre_lr
+        )
 
         # gaussian mixture model for pretraining
         self.gmm = GaussianMixture(
@@ -71,7 +81,8 @@ class Pretrain:
         Clustering (Xie et al. 2016) here: https://arxiv.org/abs/1511.06335.
         """
 
-        self.model.train()
+        self.encoder.train()
+        self.decoder.train()
 
         print("-" * 60)
         print("pretraining vae...")
@@ -82,6 +93,8 @@ class Pretrain:
         # epoch iteration
         for epoch in range(self.args.pre_epochs):
             # batch iteration
+
+            self.meter.reset()
             with tqdm(self.dataloader, desc="pretraining", unit="batches") as tepoch:
                 tepoch.set_description("Epoch {}".format(epoch + 1))
                 for batch_num, data in enumerate(tepoch):
@@ -96,26 +109,23 @@ class Pretrain:
                     self.optimizer.zero_grad()
 
                     # get reconstruction
-                    x_hat, _, _, _ = self.model(data)
+                    [means, _] = self.encoder(data)
+                    x_hat = self.decoder(means)
 
                     # compute BCE loss
-                    loss = recon_loss(x_hat, data)
-
-                    self.meter.update(loss.item())
+                    loss = recon_loss(data, x_hat)
 
                     # backprop
                     loss.backward()
                     self.optimizer.step()
 
-                    self.writer.add_scalar(
-                        "Loss/pretrain", self.meter.avg, epoch * len(self.dataloader) + batch_num
-                    )
+                    self.meter.update(loss.detach().cpu().numpy())
 
-                print("\tepoch {} average loss: {}\n".format(epoch + 1, self.meter.avg))
+                print("\tepoch {} average loss: {}\n".format(epoch, self.meter.avg))
 
-        # collect garbage, empty cache (cuda memory issues)
-        gc.collect()
-        torch.cuda.empty_cache()
+        # # collect garbage, empty cache (cuda memory issues)
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
     def fit_gmm(self):
         """
@@ -128,7 +138,7 @@ class Pretrain:
         all_labels = []
 
         # eval mode for latent variable generation
-        self.model.eval()
+        self.encoder.eval()
 
         # shouldn't update network for inference
         with tqdm(self.dataloader, desc="GMM fitting", unit="batches") as tepoch:
@@ -139,22 +149,23 @@ class Pretrain:
 
                 # compress data into latent
                 with torch.no_grad():
-                    _, latent, _, _ = self.model(data)
+                    means, _ = self.encoder(data)
 
-                all_data.append(latent)
+                all_data.append(means)
                 all_labels.append(labels)
 
         all_labels = torch.cat(all_labels).cpu().detach().numpy()
-        all_data = torch.cat(all_data).cpu().detach().numpy()
+        all_latents = torch.cat(all_data)
+        all_data = all_latents.cpu().detach().numpy()
 
         # fit GMM on batch
-        self.gmm.fit(all_data)
-
-        predicted = self.gmm.predict(all_data)
+        predicted = self.gmm.fit_predict(all_data)
 
         acc = cluster_acc(predicted, all_labels)
 
         print(f"Accuracy: {acc*100}%")
+
+        return (all_latents, all_labels)
 
     def pretrain(self):
         """
@@ -173,10 +184,13 @@ class Pretrain:
         self.train_recon()
 
         # fit GMM on encoded data
-        self.fit_gmm()
+        all_data, all_labels = self.fit_gmm()
 
         # output the original GMM cluster weights
         print("weights: {}".format(self.gmm.weights_))
+
+        self.model = VaDE(self.args, self.encoder, self.decoder)
+        self.model.to(self.device)
 
         # update GMM init with GMM ran on pretrained autoncoder output
         self.model.pi_prior.data = torch.from_numpy(self.gmm.weights_).float().to(self.device)
@@ -185,6 +199,12 @@ class Pretrain:
         self.model.log_var_prior.data = (
             torch.log(torch.from_numpy(self.gmm.covariances_)).float().to(self.device)
         )
+
+        predicted, _ = self.model.predict(all_data)
+
+        acc = cluster_acc(predicted, all_labels)
+
+        print(f"VaDE acc: {acc}")
 
         # save pretrained model
         torch.save(self.model.state_dict(), self.save_path + "pretrain.pk")

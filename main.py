@@ -12,7 +12,7 @@ from torchvision import transforms
 
 from pretrain import Pretrain
 from trainer import Trainer
-from utils import get_image_dims, model_params
+from utils import model_params
 
 load_dotenv()
 
@@ -26,10 +26,9 @@ def main():
 
     """
 
-
     # deterministic outputs
-    torch.manual_seed(0)
-    np.random.seed(0)
+    # torch.manual_seed(0)
+    # np.random.seed(0)
 
     args = model_params()
 
@@ -51,14 +50,18 @@ def main():
         transform=transforms.Compose([transforms.ToTensor()]),
     )
 
-    train_loader = DataLoader(mnist_train, batch_size=128, shuffle=True)
+    # print(mnist_train[0])
+    full_data = torch.utils.data.ConcatDataset([mnist_train, mnist_test])
+
+    train_loader = DataLoader(full_data, batch_size=800, shuffle=True, num_workers=8)
 
     # if no user specified input size
     if not args.input_size:
         args.input_size = 784
 
     if not args.length:
-        args.length = len(mnist_train)
+        args.length = len(full_data)
+        print(args.length)
 
     # pretrain reconstruction
     if not args.load_pretrain and not args.eval and not args.load_model:

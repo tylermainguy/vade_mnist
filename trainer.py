@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from models.vade import VaDE
-from utils import AverageMeter, cluster_acc, init_weights, remove_dropout
+from utils import AverageMeter, DataParallelWrapper, cluster_acc, init_weights, remove_dropout
 
 load_dotenv()
 
@@ -66,7 +66,7 @@ class Trainer:
         # model saving
         self.save_path = "ckpt/"
 
-        # load existing model
+        # load existing model.epoch + 1,
         if self.args.load_model or self.args.eval:
             self.load_model()
 
@@ -80,7 +80,7 @@ class Trainer:
             torch.autograd.set_detect_anomaly(True)
 
     def load_pretrained(self):
-        """Load pretrained VAE."""
+        """load pretrained vae."""
 
         self.loss_idx = []
         self.loss_averages = []
@@ -91,7 +91,7 @@ class Trainer:
 
     def load_model(self):
         """
-        Load saved model data.
+        load saved model data.
         """
 
         checkpoint = torch.load(self.save_path + "model.pk", map_location=self.device)
@@ -107,10 +107,10 @@ class Trainer:
 
     def train(self):
         """
-        Train the model for an epoch. Loss function is computed using the
-        evidence lower bound (ELBO) approximation.
+        train the model for an epoch. loss function is computed using the
+        evidence lower bound (elbo) approximation.
 
-        Parameters
+        parameters
         ----------
         dataloader : torch.utils.data.dataloader.DataLoader
             DataLoader object containing training samples.
@@ -125,9 +125,12 @@ class Trainer:
         # ignore dropout during clustering
         self.model.apply(remove_dropout)
 
+        self.meter.reset()
         # batch iteration
         with tqdm(self.dataloader, unit="batches") as tepoch:
+            # print(self.scheduler.get_last_lr()[0])
             tepoch.set_description("Epoch {}".format(self.epoch + 1))
+
             for batch_num, data in enumerate(tepoch):
 
                 data, labels = data
@@ -146,18 +149,17 @@ class Trainer:
                 # compute ELBO loss
                 loss = self.model.elbo_loss(data, x_hat, means, stds, latent)
 
-                self.meter.update(loss.item())
-
                 # backprop
                 loss.backward()
+
+                # print(f"mu grad: {self.model.mu_prior.grad}")
                 self.optimizer.step()
+                self.meter.update(loss.item())
 
-                self.writer.add_scalar(
-                    "Loss/train", self.meter.avg, self.epoch * len(self.dataloader) + batch_num
-                )
+            self.writer.add_scalar("Loss/train", self.meter.avg, self.epoch)
 
-                self.loss_idx.append(self.epoch * len(self.dataloader) + batch_num)
-                self.loss_averages.append(self.meter.avg)
+            self.loss_idx.append(self.epoch * len(self.dataloader) + batch_num)
+            self.loss_averages.append(self.meter.avg)
 
         # logging
         torch.save(
@@ -181,30 +183,31 @@ class Trainer:
         all_preds = []
         all_labels = []
         # batch iteration
-        with tqdm(self.dataloader, unit="batches") as tepoch:
-            tepoch.set_description("Epoch {}".format(self.epoch + 1))
-            for batch_num, data in enumerate(tepoch):
+        with torch.no_grad():
+            with tqdm(self.dataloader, unit="batches") as tepoch:
+                tepoch.set_description("Epoch {}".format(self.epoch + 1))
+                for batch_num, data in enumerate(tepoch):
 
-                data, labels = data
+                    data, labels = data
 
-                data = torch.flatten(data, start_dim=1)
-                # forward pass
-                data = data.to(self.device)
-                _, latent, _, _ = self.model(data)
+                    data = torch.flatten(data, start_dim=1)
+                    # forward pass
+                    data = data.to(self.device)
+                    _, latent, _, _ = self.model(data)
 
-                preds, _ = self.model.predict(latent)
+                    preds, _ = self.model.predict(latent)
 
-                preds = torch.tensor(preds)
+                    preds = torch.tensor(preds)
 
-                all_preds.append(preds)
-                all_labels.append(labels)
+                    all_preds.append(preds)
+                    all_labels.append(labels)
 
         all_labels = torch.cat(all_labels).cpu().detach().numpy()
         all_preds = torch.cat(all_preds).cpu().detach().numpy()
 
         acc = cluster_acc(all_preds, all_labels) * 100
 
-        print(f"Accuracy: {acc}")
+        print(f"Accuracy: {acc:.2f}")
 
     def training_loop(self):
         """
@@ -217,8 +220,8 @@ class Trainer:
                 print("training vae...")
                 self.train()
 
+            # if self.epoch % 5 == 0:
             self.evaluate()
-            # self.visualize_tissue()
 
             if self.args.eval:
                 return
